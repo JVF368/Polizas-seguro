@@ -1,0 +1,496 @@
+---
+title: "Modelos de clasificación para predecir ventas de pólizas de seguro"
+author: "Jordi Vanrell Forteza"
+date: "30/1/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+rm(list=ls())
+knitr::opts_chunk$set(echo = F, cache = F, message = F, warning = F)
+```
+```{r package_installer, include=FALSE}
+#install.packages("tidyverse")
+library(tidyverse)
+#install.packages("fastDummies")
+#install.packages("ROSE")
+#install.packages("caret")
+library(caret)
+#install.packages("margins")
+#install.packages("MASS")
+#install.packages("rpart")
+#install.packages("rpart.plot")
+#install.packages("kableExtra")
+library(kableExtra)
+library(gbm)
+```
+
+# 1. Marco general, base de datos y estructura
+
+La finalidad de este estudio es encontrar el mejor modelo predictivo para que determinada compañía pueda clasificar, entre los clientes que previamente tienen contratado un seguro médico, a los interesados en una póliza para su vehículo.
+
+La base de datos original procede de [Kaggle](https://www.kaggle.com/anmolkumar/health-insurance-cross-sell-prediction). Únicamente se hace uso de una parte de los datos del fichero `train.csv`, los datos de entrenamiento, que contiene información anonimizada de unos 380,000 clientes respecto de las siguientes variables:
+
+* *id*: número de identificación del cliente.
+
+* *Gender*: género del cliente (valores *Male*, *Female*)
+
+* *Age*: edad del cliente (en años)
+
+* *Driving_License*: el cliente tiene (1) o no (0) carnet de conducir.
+
+* *Region_Code*: código numérico de la región donde vive el cliente (53 distintos)
+
+* *Previously_Insured*: el cliente ya tiene (1) o no póliza de seguro.
+
+* *Vehicle_Age*: tiempo que tiene el vehículo, en tres categorías (*<1 year*, *1-2 years* y *>2 years*)
+
+* *Vehicle_Damage*: si el cliente tuvo (*Yes*) o no (*No*) un accidente en el pasado.
+
+* *Annual_Premium*: la prima anual que pagaría el cliente.
+
+* *PolicySalesChannel*: código del canal de ventas (155 distintos)
+
+* *Vintage*: antigüedad del cliente en la compañía (en días)
+
+* *Response*: si finalmete contrató (1) o no (0) la póliza de seguro de vehículos.
+
+Esta última es la variable dependiente en los modelos.
+
+\newpage
+
+# 2. Preparación de la base de datos
+
+```{r data_loading}
+data_read <- read.csv("train.csv", header = T, sep = ",", dec = ".")
+```
+
+Tras la carga de datos, por limitaciones computacionales, lo primero que se hace es extraer una submuestra del 3% de las observaciones del _data set_.  
+
+```{r}
+set.seed(0603)
+sample <- sample(1:nrow(data_read), round(nrow(data_read)*.03))
+data_read <- data_read[sample,]
+```
+
+Luego se procede a codificar a valores numéricos las variables *Gender*, *Vehicle_Damage* y *Vehicle_Age*, que se transforma en dos *dummies* (la categoría de referencia es *<1 year*).
+
+```{r data_parsing}
+# Variables con valores no numéricos -> valores numéricos
+data_read$Gender <- as.numeric(ifelse(data_read$Gender=="Male", 1, 0))
+data_read$Vehicle_Damage <- as.numeric(ifelse(data_read$Vehicle_Damage=="Yes", 1, 0))
+library(fastDummies) 
+data <- dummy_cols(data_read, select_columns = c("Vehicle_Age"),
+                   remove_first_dummy=T) # Vehicle_Age -> 2 dummies.
+data <- rename(data, Vehicle_Age_1Y_to_2Y = `Vehicle_Age_1-2 Year`,
+               Vehicle_Age_plus_2Y = `Vehicle_Age_> 2 Years`)
+data <- subset(data, select = -c(Vehicle_Age, id)) # Descartamos id, Vehicle_Age
+```
+
+Después se hacen dos *target_encoding* con *Region_Code* y *Policy_Sales_Channel*. Cabe señalar que, de las 155 categorías de esta última, las categorías *26*, *124* y *152* suponen más del 75% de las observaciones. Por esta razón se opta por generar dos *dummies* (*Channel_124* y *Channel_26*; *152* se convierte en la categoría de referencia) y conservar solamente el *target encoding* de todas las demás. Finalmente, anticipando la necesidad de hacer *SMOTE* se transforman temporalmente *todas* las variables a factores para evitar valores fuera de los rangos razonables de las variables (p.e. menores de edad, pólizas negativas, etc.)
+
+```{r target_encoding_and_parsing}
+targ_encod = data.frame(Region_Code = data$Region_Code, # Target encoding x2
+                        Policy_Sales_Channel = data$Policy_Sales_Channel,
+                        Response = data$Response)
+preview <- targ_encod %>% group_by(Region_Code) %>%
+  summarise(Encoded_Region = mean(Response))
+preview_2 <- targ_encod %>% group_by(Policy_Sales_Channel) %>%
+  summarise(Channel = mean(Response))
+data <- left_join(left_join(data, preview), preview_2)
+data$Channel_124 = ifelse(data$Policy_Sales_Channel==124, 1, 0)
+data$Channel_26 = ifelse(data$Policy_Sales_Channel==26, 1, 0)
+sel_cat = c(26, 124, 152)
+data$Channel_other = ifelse(data$Policy_Sales_Channel %in% sel_cat, 0, data$Channel)
+data <- subset(data, select = -c(Region_Code, Policy_Sales_Channel, Channel))
+# Transformación en factores en previsión de hacer SMOTE
+factors <- c('Gender','Age','Driving_License','Previously_Insured','Vehicle_Damage',
+             'Annual_Premium', 'Vintage', 'Response', 'Vehicle_Age_plus_2Y',
+             'Vehicle_Age_1Y_to_2Y','Encoded_Region', 'Channel_124', 'Channel_26',
+             'Channel_other')
+data[ ,factors] <- lapply(data[, factors], factor)
+```
+
+Luego se divide la base de datos en dos conjuntos, el 70% de entrenamiento y el 30% de test. Se dispone de `r nrow(data)` observaciones; se considera que la mitad de la submuestra es suficiente para modelizar en una primera etapa y se reserva un 20% del entrenamiento como datos de validación. Esto no sería realmente necesario porque pretende aplicarse validación cruzada, pero los valores de la variable dependiente están muy desbalanceados y será necesario hacer un SMOTE sobre los datos de entrenamiento. Con la muestra de validación se asegura testear efectivamente la exactitud predictiva sobre observaciones reales y no sobre observaciones sintéticas fruto del proceso SMOTE.
+
+```{r data_division}
+set.seed(16112020) # Train 50%, Validation 20%, Test 30%
+train <- sample(1:nrow(data), round(nrow(data)*.7))
+data.train <- data[train,]
+data.test <- data[-train,]
+# Luego, del conjunto de entreamiento, se reserva una parte:
+val_fraction <- sample(1:nrow(data.train), round(nrow(data.train)*(2/7)))
+validation <- data.train[val_fraction,]
+data.train.model <- data.train[-val_fraction,]
+table <- table(data.train.model$Response)
+```
+
+\begin{center}
+Table 1: Distribución de la variable dependiente (datos de entrenamiento antes de SMOTE)
+\end{center}
+Real 0 | Real 1 |
+-:|-:
+`r table[1]` | `r table[2]`
+
+
+```{r train_SMOTE_and_data_parsing_2}
+library(ROSE)
+data.train.rose.model <- ROSE(Response ~ ., data = data.train.model, seed = 16112020, 
+                        N = (sum(table) + (table[1] - table[2])))$data
+```
+
+\newpage
+
+# 3. Métodos de aprendizaje supervisado
+
+## 3.1. Modelo de clasificación logística (Logit)
+
+Se desea estimar el primer modelo sencillo en base a una regresión logística de clasificción. Para ello primero se transforman los datos para tenerlos en formato numérico. A continuación se efectúa la estimación por máxima verosimilitud de los coeficientes del modelo con el fin de maximizar la probabilidad de que una observación se encuentre efectivamente en la categoría de la variable *Response* que recogen los datos, usando la función `glm` del paquete `caret`.
+
+```{r glm_margins, cache=TRUE}
+data.train.rose.model[, factors] <- # Se pasa a numérico para LOGIT
+  lapply(lapply(data.train.rose.model[, factors], as.character), as.numeric)
+validation[, factors] <- 
+  lapply(lapply(validation[, factors], as.character), as.numeric)
+library(margins)
+model_glm = glm(Response ~ ., data = data.train.rose.model, family = binomial)
+marg_eff <- margins(model_glm, type = "response")
+```
+
+```{r eval=FALSE}
+\begin{center}
+Table 2: Efectos marginales (Logit)
+\end{center}
+
+Variable | Efecto marginal
+-|-:
+Gender | `r round(mean(marg_eff$dydx_Gender),5)`
+Age | `r round(mean(marg_eff$dydx_Age),5)`
+Driving_License | `r round(mean(marg_eff$dydx_Driving_License),5)`
+Previously_Insured | `r round(mean(marg_eff$dydx_Previously_Insured),5)`
+Vehicle_Damage | `r round(mean(marg_eff$dydx_Vehicle_Damage),5)`
+Annual_Premium | `r round(mean(marg_eff$dydx_Annual_Premium),8)`
+Vintage | `r round(mean(marg_eff$dydx_Vintage),5)`
+Vehicle_Age_plus_2Y | `r round(mean(marg_eff$dydx_Vehicle_Age_plus_2Y),5)`
+Vehicle_Age_1Y_to_2Y | `r round(mean(marg_eff$dydx_Vehicle_Age_1Y_to_2Y),5)`
+Encoded_Region | `r round(mean(marg_eff$dydx_Encoded_Region ),5)`
+Channel_124 | `r round(mean(marg_eff$dydx_Channel_124),5)`
+Channel_26 | `r round(mean(marg_eff$dydx_Channel_26),5)`
+Channel_other | `r round(mean(marg_eff$dydx_Channel_other),5)`
+
+#De los efectos marginales de las variables categóricas destaca que las personas previamente aseguradas (*Previously_Insured* = 1) reducen en `r round(mean(marg_eff$dydx_Previously_Insured),4)` la probabilidad de responder afirmativamente con respecto de los no asegurados. Asimismo, las personas que han sufrido algún accidente (*Vehicle_Damage* = 1) tienen una probabilidad `r round(mean(marg_eff$dydx_Vehicle_Damage),4)` mayor de contratar la póliza respecto de las que no. 
+```
+
+```{r glm_pred_val, cache=TRUE}
+pred_glm = predict(model_glm, validation, type = "response")
+pred_glm = ifelse(pred_glm > .5, 1, 0)
+table_glm = table(pred_glm, validation$Response)
+Accuracy_glm = mean(pred_glm==validation$Response)
+```
+
+Después se usa la muestra de validación para predecir *Response* y compararla con los datos observados de esta variable. Puede decirse que, en este caso, el modelo *Logit* arroja exactitud predictiva del `r 100*round(Accuracy_glm, 4)`% sobre la muestra de validación. Véase la matriz de confusión:
+
+\begin{center}
+Table 2: Matriz de confusión (Logit)
+\end{center}
+
+&nbsp;| Real 0 | Real 1 |
+-|-:|-:
+Pred 0 | `r table_glm[1,1]` | `r table_glm[1,2]`
+Pred 1 | `r table_glm[2,1]` | `r table_glm[2,2]`
+
+## 3.2 Análisis discriminante lineal (ADL)
+
+Otro modelo sencillo aplicable a problemas de clasificación es el ADL. Este método modeliza la distribución de las variables explicativas por separado (funciones de densidad por categorías) y luego se sirve de las probabilidades de las categorías de *Response* condicionadas a las variables explicativas para clasificar las observaciones en la categoría con mayor puntuación discriminante, de acuerdo con sus valores y las funciones de densidades de las variables explicativas.
+
+```{r lda, cache=TRUE}
+library(MASS) # LDA de clasificación
+model_lda = lda(Response ~ ., data = data.train.rose.model)
+pred_lda = predict(model_lda, validation)
+pred_lda = ifelse(pred_lda$posterior[,2] > .5, 1, 0)
+table_lda = table(pred_lda, validation$Response)
+Accuracy_lda = mean(pred_lda==validation$Response)
+```
+```{r winner_lda_coefficients, eval=FALSE}
+knitr::kable(model_lda$scaling, caption='Coeficientes discriminantes') %>% kable_styling(latex_options = "hold_position")
+#Los coeficientes discriminantes más importantes de entre las variables categóricas coinciden con los del modelo *Logit*: `r round(model_lda$scaling[4], 4)` para *Previously_Insured* y `r round(model_lda$scaling[5], 4)` para *Vehicle_Damage*.
+```
+
+Tras usar la muestra de validación para predecir *Response* y compararla con los datos observados, el ADL arroja una exactitud predictiva del `r 100*round(Accuracy_lda, 4)`% sobre la muestra de validación. Véase la matriz de confusión:
+
+\begin{center}
+Table 3: Matriz de confusión (LDA)
+\end{center}
+
+&nbsp;| Real 0 | Real 1 |
+-|-:|-:
+Pred 0 | `r table_lda[1,1]` | `r table_lda[1,2]`
+Pred 1 | `r table_lda[2,1]` | `r table_lda[2,2]`
+
+\newpage
+
+## 3.3. Métodos de clasificación basados en árboles
+
+En clasificación, los métodos basados en árboles estratifican las observaciones en regiones de espacio predictor con el criterio de minimizar el error de clasificación.
+
+### 3.3.1. Árbol de clasificación
+
+Los árboles individuales son el método más sencillo posible dentro de este tipo de métodos. Como prerrequisito, la variable dependiente se transforma a factor en ambas muestras. La construcción de los árboles depende de tres parámetros controlables:
+
+* `minsplit` es la cantidad mínima de observaciones que se contemplan para hacer una división en un nodo.
+
+* `minbucket` es la cantidad mínima de observaciones que se contemplan en un nodo terminal.
+
+* `cp` es el parámetro que marca el umbral de complejidad, es decir, la mejora mínima en el proceso de clasificación para que pueda contemplarse hacer una división adicional.
+
+Limitado `cp` a 0.01 y `minsplit` y `minbucket` a 10 se genera un árbol y luego se evalúa la necesidad de poda.
+
+```{r class_tree_model, cache=TRUE}
+data.train.rose.model$Response <- as.factor(data.train.rose.model$Response)
+validation$Response <- as.factor(validation$Response)
+
+library(rpart) 
+tree_control = rpart::rpart.control(minsplit = 10, minbucket = 10, cp = .01)
+set.seed(16112020)
+model_tree <- rpart::rpart(Response ~ ., method = "class", 
+                           data = data.train.rose.model,
+                           control = tree_control, 
+                           parms = list(prior = c(.5,.5), split = "gini"))
+pred_tree <- predict(model_tree, validation, type = "class")
+table_tree = table(pred_tree, validation$Response)
+Accuracy_tree = mean(pred_tree==validation$Response)
+```
+
+```{r class_tree_best, cache=TRUE}
+library(rpart.plot) # representación del árbol que provee mejor Fb_Score.
+rpart.plot(model_tree, type =4, clip.right.labs = F, branch =.5, tweak =1, main ="Árbol de clasificación")
+```
+
+Parece suficientemente sencillo como para no suponer un problema de sobreajuste, así que definitivamente se prescinde de la poda.
+
+Con este árbole de clasificación se obtiene una exactitud predictiva del `r 100*round(Accuracy_tree, 4)`% sobre la muestra de validación. Véase la matriz de confusión:
+
+\newpage
+\begin{center}
+Table 4: Matriz de confusión (Árbol clas.)
+\end{center}
+
+&nbsp;| Real 0 | Real 1 |
+-|-:|-:
+Pred 0 | `r table_tree[1,1]` | `r table_tree[1,2]`
+Pred 1 | `r table_tree[2,1]` | `r table_tree[2,2]`
+
+### 3.3.2. Bosques aleatorios
+
+Se pretende obtener mejores resultados a través del método de *bosques aleatorios*.
+
+Para aplicar el método se hace uso el método `ranger` del paquete `caret`. El funcionamiento básico consiste en combinar una serie de árboles construidos con una selección aleatoria de cierto número de predictores (`mtry`) entre los disponibles. Se registra la clase predicha por cada árbol para cada observación y se guarda la categoría más frecuente de las predichas. 
+
+El modelo se *sintoniza* de acuerdo con los siguientes parámetros:
+
+* `min.node.size`: la cantidad mínima de observaciones que se contemplan para hacer una división en un nodo. Se estable arbitrariamente en 10.
+
+* `num.trees`: número de árboles con que se construye el bosque. En principio se obtienen mejores resultados cuanto más elevado sea. Se considera que 4000 árboles son suficientes y que, a partir de esa cifra, las ganancias son mínimas.
+
+* `mtry`: número de variables que entran en juego en la construcción de los árboles. Se sabe que un valor demasiado elevado en este caso produce sobrejuste en el modelo. Como se usa validación cruzada en *5-fold* se presume que los resultados no estarán sobreajustados.
+
+```{r random_forest, cache=TRUE}
+set.seed(16112020)
+seeds <- vector(mode = "list", length = 6)
+for(i in 1:5){
+  seeds[[i]]<- sample.int(1000, 13)
+}
+seeds[[6]] <- sample.int(1000, 1)
+
+fitControl <- caret::trainControl(method = 'cv', seeds = seeds, number = 5)
+rfGrid <-  expand.grid(mtry = seq(from = 1, to = 13, by = 1),
+                       splitrule = c('gini'), 
+                       min.node.size = 10)
+model_rf <- train(Response ~ ., data = data.train.rose.model, 
+                      method = 'ranger', trControl = fitControl,
+                      tuneGrid = rfGrid, 
+                      num.trees = 4000, 
+                      importance = 'impurity')
+pred_rf = predict(model_rf, validation)
+table_rf = table(pred_rf, validation$Response)
+Accuracy_rf = mean(pred_rf==validation$Response)
+```
+```{r rf_importance, eval=FALSE}
+knitr::kable(varImp(model_rf)$importance, caption='Importance') %>% kable_styling(latex_options = "hold_position")
+```
+
+```{r}
+knitr::kable(model_rf$bestTune, caption='Mejor Bosque aleatorio') %>% kable_styling(latex_options = "hold_position")
+```
+
+Tras estimar bosques aleatorios con `mtry` entre 1 y 13, el mejor ha resultado ser el bosque aleatorio con `mtry` = 8 (bajo las condiciones de 4000 árboles, `min.node.size` de 10 y criterio de división _Gini_).
+
+Con este método se obtiene una exactitud predictiva del `r 100*round(Accuracy_rf, 4)`% sobre la muestra de validación. Véase la matriz de confusión:
+
+\begin{center}
+Table 6: Matriz de confusión (Bosques Aleatorios)
+\end{center}
+
+&nbsp;| Real 0 | Real 1 |
+-|-:|-:
+Pred 0 | `r table_rf[1,1]` | `r table_rf[1,2]`
+Pred 1 | `r table_rf[2,1]` | `r table_rf[2,2]`
+
+
+\newpage
+
+### 3.3.3. Boosting
+
+Con la técnica de *boosting* se crean múltiples copias de remuestreo en entrenamiento mediante *bootstrap* y se estima un árbol para cada copia con la información de los previos para luego combinarlos en una única predicción.
+
+El modelo se *sintoniza* de acuerdo con los siguientes parámetros:
+
+* `num.trees`: número de árboles o iteraciones. En _boosting_ los resultados mejoran con muchos árboles, pero un número de árboles demasiado grande puede generar sobreajuste; la validación cruzada sirve para evitar este efecto.
+
+* `interact.depth`: profundidad máxima del árbol. En general se sabe que los modelos con más profundidad de árbol tienden a sobreajustar más. A la vez, los modelos menos profundos son computacionalmente más eficientes pero requieren un número más elevado de árboles.
+
+* `shrinkage`: la contribución de cada árbol al resultado final o, dicho de otra manera, la velocidad a la que boosting aprende. Valores más pequeños facilitan que el algoritmo se detenga antes de sobreajustar. Toma posibles valores entre 0 y 1, pero los valores más pequeños permiten generalizar bien (aunque requieren más árboles).
+
+* `n.minobsinnode`: número mínimo de observaciones en los nodos terminales (y la complejidad de cada árbol). Por simplicidad se establece en todo caso en 10, que es el valor por defecto.
+
+De cara a sintonizar el modelo, para evitar dinámicas de sobreajuste, el análisis se efectúa con *5-fold CV*. 
+
+```{r boosting, cache=TRUE}
+set.seed(16112020)
+seeds <- vector(mode = "list", length = 6)
+for(i in 1:5){
+  seeds[[i]]<- sample.int(1000, 48)
+}
+seeds[[6]] <- sample.int(1000, 1)
+
+fitControl <- caret::trainControl(method = 'cv', seeds = seeds, number = 5)
+
+gbmGrid <-  expand.grid(interaction.depth = c(14, 18, 22, 26),
+                        n.minobsinnode = 10,
+                        n.trees = seq(from = 2000, to = 5000, by = 1000),
+                        shrinkage = c(.05, .3, .5))
+model_bst <- caret::train(Response ~ ., data = data.train.rose.model, 
+                          method = 'gbm', trControl = fitControl,
+                          tuneGrid = gbmGrid, metric = 'Accuracy',
+                          distribution = 'bernoulli', verbose = F)
+pred_bst = predict(model_bst, validation)
+table_bst = table(pred_bst, validation$Response)
+Accuracy_bst = mean(pred_bst==validation$Response)
+```
+```{r}
+knitr::kable(model_bst$bestTune, caption='Mejor Boosting') %>% kable_styling(latex_options = "hold_position")
+```
+
+Contemplados valores de `interaction.depth` entre 14 y 26, de `n.trees` entre 2000 y 5000 y de `shrinkage` de 0.05 a 0.5, los mejores resultados se han obtenido con 4000 árboles, `interaction.depth`de 18 y `shrinkage` de 0.3.
+
+Con este modelo se obtiene una exactitud predictiva del `r 100*round(Accuracy_bst, 4)`%. Véase la matriz de confusión:
+
+\begin{center}
+Table 8: Matriz de confusión (Boosting)
+\end{center}
+
+&nbsp;| Real 0 | Real 1 |
+-|-:|-:
+Pred 0 | `r table_bst[1,1]` | `r table_bst[1,2]`
+Pred 1 | `r table_bst[2,1]` | `r table_bst[2,2]`
+
+\newpage
+
+# 4. Selección de modelo y estimación sobre los datos de test
+
+## 4.1. Selección del modelo
+
+Recapitúlense las cifras generales de los modelos contemplados.
+
+\begin{center}
+Table 9: Resumen de modelos
+\end{center}
+
+Modelo | Accuracy (validation)
+-|-:
+Logit | `r Accuracy_glm`
+LDA | `r Accuracy_lda`
+Class. Tree | `r Accuracy_tree`
+Random Forest | `r Accuracy_rf`
+Boosting | `r Accuracy_bst`
+
+_Boosting_ es claramente superior al resto de modelos.
+
+## 4.2. Integración de las muestras de entrenamiento y validación
+
+Como la separación anterior en *training* y *validación* se efectuó antes de aplicar SMOTE, se rescata el conjunto original de los datos de entrenamiento (previo a la extracción del conjunto de validación) y se somete al mismo procedimiento. Por simplicidad se establece que el número de observaciones tras el SMOTE sea el mismo que en el conjunto de entrenamiento anterior sin la muestra de validación, pero esta vez el SMOTE habrá tenido en cuenta también los datos de validación para sintetizar las observaciones que reequilibran la muestra. Luego se comprueba el equilibrio entre las observaciones de la variable dependiente.
+
+```{r last_parsing, cache=TRUE}
+data.train[ ,factors] <- lapply(data.train[, factors], factor)
+data.train <- ROSE(Response ~ ., data = data.train, seed = 16112020,
+                   N = (sum(table) + (table[1] - table[2])))$data
+data.train[, factors] <- lapply(lapply(data.train[, factors], as.character), as.numeric)
+data.train$Response <- as.factor(data.train$Response)
+data.test[, factors] <- lapply(lapply(data.test[, factors], as.character), as.numeric)
+data.test$Response <- as.factor(data.test$Response)
+```
+
+\begin{center}
+Table 10: Distribución de la variable dependiente (Conjuntos de entrenamiento original y validación tras SMOTE)
+\end{center}
+
+Real 0 | Real 1 |
+-:|-:
+`r table(data.train$Response)[1]` | `r table(data.train$Response)[2]`
+
+
+## 4.3. Resintonización del modelo ganador
+
+Por último, como en este caso se dispone de los valores ciertos de la variable dependiente en la muestra de test, puede aplicarse el modelo ganador para predecir sobre este conjunto y ajustarlo para mejorar, si cabe, su exactitud predictiva.
+
+```{r winner_boosting_2, cache=TRUE}
+set.seed(16112020)
+seeds <- vector(mode = "list", length = 6)
+for(i in 1:5){
+  seeds[[i]]<- sample.int(1000, 48)
+}
+seeds[[6]] <- sample.int(1000, 1)
+
+fitControl <- caret::trainControl(method = 'cv', seeds = seeds, number = 5)
+
+gbmGrid <-  expand.grid(interaction.depth = c(34, 38, 42, 46),
+                        n.minobsinnode = 10,
+                        n.trees = seq(from = 2500, to = 10000, by = 2500),
+                        shrinkage = c(.02, .05, .5))
+win_model_bst <- caret::train(Response ~ ., data = data.train, 
+                          method = 'gbm', trControl = fitControl,
+                          tuneGrid = gbmGrid, metric = 'Accuracy',
+                          distribution = 'bernoulli', verbose = F)
+pred_bst = predict(win_model_bst, data.test)
+table_bst = table(pred_bst, data.test$Response)
+Accuracy_bst = mean(pred_bst==data.test$Response)
+```
+
+Contemplados valores de `interaction.depth` entre 34 y 46, de `n.trees` entre 2500 y 10000 y de `shrinkage` de 0.02 a 0.5, los mejores resultados se han obtenido con 7500 árboles, `interaction.depth`de 42 y `shrinkage` de 0.05.
+
+```{r}
+knitr::kable(win_model_bst$bestTune, caption='Modelo ganador (sobre los datos de test)') %>% kable_styling(latex_options = "hold_position")
+```
+
+Con este modelo se obtiene una exactitud predictiva del `r 100*round(Accuracy_bst, 4)`% sobre la muestra de test, que ya es superior a los resultados obtenidos sobre la muestra de validación para este modelo. Véase la matriz de confusión:
+
+\begin{center}
+Table 12: Matriz de confusión (Boosting, modelo ganador)
+\end{center}
+
+&nbsp;| Real 0 | Real 1 |
+-|-:|-:
+Pred 0 | `r table_bst[1,1]` | `r table_bst[1,2]`
+Pred 1 | `r table_bst[2,1]` | `r table_bst[2,2]`
+
+En cuanto a la importancia de las variables, según el modelo ganador las más importantes son `Vehicle_Damage`, `Vintage`, `Annual_Premium`, `Age` y `Previously_Insured`, tres de los cuales aparecían ya en el árbol de clasificación del apartado 3.1.
+
+```{r}
+knitr::kable(varImp(win_model_bst, numTrees=7500)$importance, caption='Importancia relativa') %>% kable_styling(latex_options = "hold_position")
+```
+
+## 4.4. Notas finales
+
+En una nota final, cabe señalar que podría haberse hecho una resintonización más precisa de los modelos en los puntos 3.3.3. y 4.3. pero los medios informáticos con los que se cuenta dificultan el proceso aun a pesar de haber prescindido de una gran parte de la muestra original de los datos.
+
+Además, en una nota a parte, cabe notar que el número de falsos positivos y falsos negativos es muy alto con respecto al de verdaderos positivos cuando se aplica el modelo ganador. El modelo de clasificación de Boosting clasifica los casos lo mejor que puede según el criterio dado (*Accuracy*). Sin embargo, en la práctica podría ser más útil un modelo que sacrificara puntos de exactitud en favor de una menor tasa de falsos negativos si el objetivo de la campaña no fuera tanto clasificar correctamente el mayor número de casos como vender pólizas de seguro al mayor número de clientes posible y con el mínimo coste. En esta línea podría ser más razonable seleccionar los modelos en base a indicadores de la familia *F-Score*, que penalizan según el tipo de error. 
